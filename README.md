@@ -44,6 +44,7 @@ The implementation is retained in its project-compatible path:
 ├── run_gruneisen_thermal_expansion_v2.py
 ├── batch_gruneisen_thermal_expansion_v2.py
 ├── select_v2_representatives.py
+├── patch_mattersim_pr166.py
 ├── test_gruneisen_v2_core.py
 ├── ANISOTROPIC_GRUNEISEN_V2_DESIGN.md
 └── ANISOTROPIC_GRUNEISEN_V2_IMPLEMENTATION_STATUS.md
@@ -70,6 +71,31 @@ The tested environment is Linux/WSL with:
 - Python 3.12;
 - MatterSim 1M checkpoint;
 - float64 inference for the production validation stage.
+
+### MatterSim 1.2.4/1.2.5 batching regression
+
+MatterSim releases 1.2.4 and 1.2.5 are affected by the open upstream
+[Issue #163](https://github.com/microsoft/mattersim/issues/163). The matching
+[PR #166](https://github.com/microsoft/mattersim/pull/166) changes
+`GraphConverter` to return `M3GNetData`, allowing PyG to offset
+`three_body_indices` correctly when multiple structures are batched.
+
+Check an environment with:
+
+```bash
+python 0.scripts/gruneisen_anisotropy_calcu/patch_mattersim_pr166.py --check-only
+```
+
+Apply the reviewed one-line patch to an affected installation with:
+
+```bash
+python 0.scripts/gruneisen_anisotropy_calcu/patch_mattersim_pr166.py
+```
+
+The helper creates a timestamped backup and runs the upstream two-structure
+regression test. The v2 runner itself explicitly uses `batch_converter=False`
+and evaluates displaced structures one at a time, so this particular regression
+does not affect the v2 force loop.
 
 ## Tests
 

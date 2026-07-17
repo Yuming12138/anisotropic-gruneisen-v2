@@ -65,6 +65,25 @@ model        mattersim-v1.0.0-1M.pth
 
 The core unit tests pass in both Windows Python and the WSL MatterSim runtime.
 
+### Local MatterSim 1.2.5 batching patch
+
+The WSL MatterSim 1.2.5 environment includes the one-line fix from upstream
+PR #166:
+
+```python
+return M3GNetData(**args)
+```
+
+instead of `return Data(**args)` in `datasets/utils/converter.py`. The exact
+two-structure PyG regression test passes: the second graph's
+`three_body_indices` are offset by the first graph's `num_bonds`. The original
+installed file is retained as `converter.py.pre_pr166_20260717.bak`, and the
+environment contains `mattersim/LOCAL_PATCH_PR166.json` with both SHA256 values.
+
+`patch_mattersim_pr166.py --check-only` can verify the environment. The v2
+runner additionally sets `batch_converter=False` explicitly; its force calls
+remain single-structure even if the local dependency is later reinstalled.
+
 ## Full preflight result
 
 All 342 material directories were audited.

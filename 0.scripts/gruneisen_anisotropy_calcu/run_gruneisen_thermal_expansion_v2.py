@@ -497,6 +497,7 @@ def run_gruneisen(args: argparse.Namespace, report: dict[str, Any], context: dic
         device=device,
         dtype=args.dtype,
         compute_stress=True,
+        batch_converter=False,
     )
     result_dir: Path = context["result_dir"]
     work_dir = result_dir / "work"
