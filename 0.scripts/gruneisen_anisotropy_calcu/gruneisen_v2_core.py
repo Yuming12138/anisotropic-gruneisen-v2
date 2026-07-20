@@ -15,6 +15,7 @@ import platform
 import sys
 from dataclasses import asdict, dataclass
 from functools import lru_cache
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -41,7 +42,7 @@ class V2Parameters:
     strain: float = 0.005
     fallback_strain: float = 0.0025
     displacement_A: float = 0.01
-    mesh: tuple[int, int, int] = (30, 30, 30)
+    mesh: tuple[int, int, int] = (20, 20, 20)
     min_supercell_length_A: float = 12.0
     internal_relax_fmax_eV_A: float = 1.0e-3
     internal_relax_max_steps: int = 1000
@@ -111,12 +112,12 @@ def runtime_versions() -> dict[str, str]:
         "platform": platform.platform(),
         "numpy": np.__version__,
     }
-    for module_name in ("scipy", "ase", "phonopy", "spglib", "pymatgen", "torch", "mattersim"):
+    packages = ("scipy", "ase", "phonopy", "spglib", "pymatgen", "torch", "mattersim")
+    for package_name in packages:
         try:
-            module = __import__(module_name)
-            versions[module_name] = str(getattr(module, "__version__", "unknown"))
-        except Exception:
-            versions[module_name] = "not_importable"
+            versions[package_name] = version(package_name)
+        except PackageNotFoundError:
+            versions[package_name] = "not_installed"
     return versions
 
 
@@ -460,7 +461,9 @@ def summarize_effective_isotropy(
         mixed = []
         for row in directional:
             significant = row[np.abs(row) > tolerance]
-            mixed.append(bool(significant.size > 1 and np.min(significant) < 0.0 < np.max(significant)))
+            mixed.append(
+                bool(significant.size > 1 and np.min(significant) < 0.0 < np.max(significant))
+            )
         mixed_sign_any = bool(any(mixed))
     directional_pass = directional_available and not bool(mixed_sign_any)
 
@@ -486,6 +489,269 @@ def summarize_effective_isotropy(
     }
 
 
+def assess_production_readiness(
+    quality: dict[str, Any],
+    *,
+    residual_force_limit_eV_A: float = 1.0e-3,
+    residual_stress_limit_GPa: float = 0.1,
+    max_excluded_heat_capacity_fraction: float = 0.05,
+    extreme_gamma_abs: float = 500.0,
+    expected_acoustic_zero_modes: int = 3,
+) -> dict[str, Any]:
+    hard_failures: list[str] = []
+    fallback_reasons: list[str] = []
+    reference = quality.get("reference_force_stress", {})
+    if float(reference.get("max_force_eV_A", math.inf)) > residual_force_limit_eV_A:
+        hard_failures.append("reference_residual_force_too_large")
+    if float(reference.get("max_abs_stress_GPa", math.inf)) > residual_stress_limit_GPa:
+        hard_failures.append("reference_residual_stress_too_large")
+    if quality.get("axis_mapping_status") != "ok":
+        hard_failures.append("axis_mapping_unavailable")
+    relaxations = quality.get("internal_relaxation", {})
+    if any(report.get("status") != "converged" for report in relaxations.values()):
+        hard_failures.append("internal_relaxation_not_converged")
+    excluded_fraction = float(quality.get("max_excluded_heat_capacity_fraction", math.inf))
+    if excluded_fraction > max_excluded_heat_capacity_fraction:
+        hard_failures.append("excluded_heat_capacity_fraction_too_large")
+
+    reference_invalid = int(quality.get("reference_imaginary_or_zero_count", 0))
+    if reference_invalid > expected_acoustic_zero_modes:
+        fallback_reasons.append("reference_nonacoustic_imaginary_modes")
+    strained_imaginary = sum(
+        int(item.get("minus_imaginary_mode_count", 0))
+        + int(item.get("plus_imaginary_mode_count", 0))
+        for item in quality.get("strained_imaginary_diagnostics", [])
+    )
+    if strained_imaginary > 0:
+        fallback_reasons.append("strain_induced_imaginary_modes")
+    gamma_max = max(
+        (float(item.get("abs_max", 0.0)) for item in quality.get("gamma_statistics", [])),
+        default=0.0,
+    )
+    if gamma_max > extreme_gamma_abs:
+        fallback_reasons.append("extreme_gruneisen_parameter")
+
+    if hard_failures:
+        status = "failed"
+    elif fallback_reasons:
+        status = "requires_strain_check"
+    else:
+        status = "ready"
+    return {
+        "status": status,
+        "hard_failures": hard_failures,
+        "fallback_required": bool(fallback_reasons),
+        "fallback_reasons": fallback_reasons,
+        "observed": {
+            "reference_imaginary_or_zero_count": reference_invalid,
+            "strained_imaginary_mode_count": strained_imaginary,
+            "max_abs_gamma": gamma_max,
+            "max_excluded_heat_capacity_fraction": excluded_fraction,
+            "reference_max_force_eV_A": reference.get("max_force_eV_A"),
+            "reference_max_abs_stress_GPa": reference.get("max_abs_stress_GPa"),
+        },
+        "thresholds": {
+            "residual_force_limit_eV_A": residual_force_limit_eV_A,
+            "residual_stress_limit_GPa": residual_stress_limit_GPa,
+            "max_excluded_heat_capacity_fraction": max_excluded_heat_capacity_fraction,
+            "extreme_gamma_abs": extreme_gamma_abs,
+            "expected_acoustic_zero_modes": expected_acoustic_zero_modes,
+        },
+    }
+
+
+def compare_strain_derivatives(
+    temperatures_K: np.ndarray,
+    primary_integrals_J_per_K: np.ndarray,
+    fallback_integrals_J_per_K: np.ndarray,
+    primary_alpha_volume_per_K: np.ndarray,
+    fallback_alpha_volume_per_K: np.ndarray,
+    primary_alpha_directional_per_K: np.ndarray,
+    fallback_alpha_directional_per_K: np.ndarray,
+    *,
+    target_temperature_K: float = 100.0,
+    integral_relative_tolerance: float = 0.10,
+    alpha_volume_relative_tolerance: float = 0.05,
+    alpha_volume_absolute_tolerance_micro_per_K: float = 0.5,
+    directional_absolute_tolerance_micro_per_K: float = 1.0,
+) -> dict[str, Any]:
+    temperatures = np.asarray(temperatures_K, dtype=float)
+    primary_integrals = np.asarray(primary_integrals_J_per_K, dtype=float)
+    fallback_integrals = np.asarray(fallback_integrals_J_per_K, dtype=float)
+    primary_alpha_volume = np.asarray(primary_alpha_volume_per_K, dtype=float)
+    fallback_alpha_volume = np.asarray(fallback_alpha_volume_per_K, dtype=float)
+    primary_directional = np.asarray(primary_alpha_directional_per_K, dtype=float)
+    fallback_directional = np.asarray(fallback_alpha_directional_per_K, dtype=float)
+    if primary_integrals.shape != fallback_integrals.shape or primary_integrals.shape != (
+        len(temperatures),
+        6,
+    ):
+        raise ValueError("strain_integral_shape_mismatch")
+    if primary_alpha_volume.shape != fallback_alpha_volume.shape or primary_alpha_volume.shape != (
+        len(temperatures),
+    ):
+        raise ValueError("strain_alpha_volume_shape_mismatch")
+    if primary_directional.shape != fallback_directional.shape or primary_directional.shape != (
+        len(temperatures),
+        3,
+    ):
+        raise ValueError("strain_directional_shape_mismatch")
+
+    target_index = int(np.argmin(np.abs(temperatures - float(target_temperature_K))))
+    primary_target_integrals = primary_integrals[target_index]
+    fallback_target_integrals = fallback_integrals[target_index]
+    integral_scale = max(
+        float(np.max(np.abs(primary_target_integrals))),
+        float(np.max(np.abs(fallback_target_integrals))),
+        1.0e-25,
+    )
+    integral_relative_difference = float(
+        np.max(np.abs(primary_target_integrals - fallback_target_integrals)) / integral_scale
+    )
+    alpha_volume_difference = float(
+        abs(primary_alpha_volume[target_index] - fallback_alpha_volume[target_index])
+    )
+    alpha_volume_scale = max(
+        abs(float(primary_alpha_volume[target_index])),
+        abs(float(fallback_alpha_volume[target_index])),
+        1.0e-12,
+    )
+    alpha_volume_relative_difference = alpha_volume_difference / alpha_volume_scale
+    alpha_volume_absolute_difference_micro = alpha_volume_difference * 1.0e6
+    directional_absolute_difference_micro = float(
+        np.max(np.abs(primary_directional - fallback_directional)) * 1.0e6
+    )
+
+    reasons = []
+    if integral_relative_difference > integral_relative_tolerance:
+        reasons.append("gruneisen_integrals_not_converged")
+    if (
+        alpha_volume_relative_difference > alpha_volume_relative_tolerance
+        and alpha_volume_absolute_difference_micro
+        > alpha_volume_absolute_tolerance_micro_per_K
+    ):
+        reasons.append("alpha_volume_not_converged")
+    if directional_absolute_difference_micro > directional_absolute_tolerance_micro_per_K:
+        reasons.append("directional_alpha_not_converged")
+    return {
+        "status": "converged" if not reasons else "strain_derivative_unresolved",
+        "reasons": reasons,
+        "target_temperature_K": float(temperatures[target_index]),
+        "integral_relative_difference": integral_relative_difference,
+        "alpha_volume_relative_difference": alpha_volume_relative_difference,
+        "alpha_volume_absolute_difference_micro_per_K": alpha_volume_absolute_difference_micro,
+        "directional_max_absolute_difference_micro_per_K": directional_absolute_difference_micro,
+        "thresholds": {
+            "integral_relative_tolerance": integral_relative_tolerance,
+            "alpha_volume_relative_tolerance": alpha_volume_relative_tolerance,
+            "alpha_volume_absolute_tolerance_micro_per_K": (
+                alpha_volume_absolute_tolerance_micro_per_K
+            ),
+            "directional_absolute_tolerance_micro_per_K": (
+                directional_absolute_tolerance_micro_per_K
+            ),
+        },
+    }
+
+
+def compare_mesh_responses(
+    temperatures_K: np.ndarray,
+    screening_integrals_J_per_K: np.ndarray,
+    dense_integrals_J_per_K: np.ndarray,
+    screening_alpha_volume_per_K: np.ndarray,
+    dense_alpha_volume_per_K: np.ndarray,
+    screening_alpha_directional_per_K: np.ndarray,
+    dense_alpha_directional_per_K: np.ndarray,
+    screening_fani: np.ndarray,
+    dense_fani: np.ndarray,
+    *,
+    integral_relative_tolerance: float = 0.02,
+    alpha_volume_absolute_tolerance_micro_per_K: float = 0.5,
+    directional_absolute_tolerance_micro_per_K: float = 1.0,
+    fani_absolute_tolerance: float = 0.01,
+) -> dict[str, Any]:
+    temperatures = np.asarray(temperatures_K, dtype=float)
+    screening_integrals = np.asarray(screening_integrals_J_per_K, dtype=float)
+    dense_integrals = np.asarray(dense_integrals_J_per_K, dtype=float)
+    screening_alpha_volume = np.asarray(screening_alpha_volume_per_K, dtype=float)
+    dense_alpha_volume = np.asarray(dense_alpha_volume_per_K, dtype=float)
+    screening_directional = np.asarray(screening_alpha_directional_per_K, dtype=float)
+    dense_directional = np.asarray(dense_alpha_directional_per_K, dtype=float)
+    screening_fani_array = np.asarray(screening_fani, dtype=float)
+    dense_fani_array = np.asarray(dense_fani, dtype=float)
+    expected_integral_shape = (len(temperatures), 6)
+    expected_directional_shape = (len(temperatures), 3)
+    if screening_integrals.shape != expected_integral_shape:
+        raise ValueError("mesh_screening_integral_shape_mismatch")
+    if dense_integrals.shape != expected_integral_shape:
+        raise ValueError("mesh_dense_integral_shape_mismatch")
+    if screening_alpha_volume.shape != (len(temperatures),):
+        raise ValueError("mesh_screening_alpha_volume_shape_mismatch")
+    if dense_alpha_volume.shape != (len(temperatures),):
+        raise ValueError("mesh_dense_alpha_volume_shape_mismatch")
+    if screening_directional.shape != expected_directional_shape:
+        raise ValueError("mesh_screening_directional_shape_mismatch")
+    if dense_directional.shape != expected_directional_shape:
+        raise ValueError("mesh_dense_directional_shape_mismatch")
+    if screening_fani_array.shape != (len(temperatures),):
+        raise ValueError("mesh_screening_fani_shape_mismatch")
+    if dense_fani_array.shape != (len(temperatures),):
+        raise ValueError("mesh_dense_fani_shape_mismatch")
+
+    integral_scale = max(
+        float(np.max(np.abs(screening_integrals))),
+        float(np.max(np.abs(dense_integrals))),
+        1.0e-25,
+    )
+    integral_relative_difference = float(
+        np.max(np.abs(screening_integrals - dense_integrals)) / integral_scale
+    )
+    alpha_volume_absolute_difference_micro = float(
+        np.max(np.abs(screening_alpha_volume - dense_alpha_volume)) * 1.0e6
+    )
+    directional_absolute_difference_micro = float(
+        np.max(np.abs(screening_directional - dense_directional)) * 1.0e6
+    )
+    fani_absolute_difference = float(
+        np.max(np.abs(screening_fani_array - dense_fani_array))
+    )
+
+    reasons = []
+    if integral_relative_difference > integral_relative_tolerance:
+        reasons.append("gruneisen_integrals_mesh_not_converged")
+    if (
+        alpha_volume_absolute_difference_micro
+        > alpha_volume_absolute_tolerance_micro_per_K
+    ):
+        reasons.append("alpha_volume_mesh_not_converged")
+    if directional_absolute_difference_micro > directional_absolute_tolerance_micro_per_K:
+        reasons.append("directional_alpha_mesh_not_converged")
+    if fani_absolute_difference > fani_absolute_tolerance:
+        reasons.append("fani_mesh_not_converged")
+    return {
+        "status": "converged" if not reasons else "mesh_convergence_unresolved",
+        "reasons": reasons,
+        "integral_relative_difference": integral_relative_difference,
+        "alpha_volume_max_absolute_difference_micro_per_K": (
+            alpha_volume_absolute_difference_micro
+        ),
+        "directional_max_absolute_difference_micro_per_K": (
+            directional_absolute_difference_micro
+        ),
+        "fani_max_absolute_difference": fani_absolute_difference,
+        "thresholds": {
+            "integral_relative_tolerance": integral_relative_tolerance,
+            "alpha_volume_absolute_tolerance_micro_per_K": (
+                alpha_volume_absolute_tolerance_micro_per_K
+            ),
+            "directional_absolute_tolerance_micro_per_K": (
+                directional_absolute_tolerance_micro_per_K
+            ),
+            "fani_absolute_tolerance": fani_absolute_tolerance,
+        },
+    }
+
+
 def input_fingerprint(
     root_poscar: Path,
     elastic_poscar: Path,
@@ -494,6 +760,7 @@ def input_fingerprint(
     parameters: V2Parameters,
     runner_path: Path,
     core_path: Path,
+    execution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     files = {
         "root_poscar": {"path": str(root_poscar), "sha256": sha256_file(root_poscar)},
@@ -506,7 +773,11 @@ def input_fingerprint(
         files["model"] = {"path": str(model_path), "sha256": sha256_file(model_path)}
     else:
         files["model"] = {"path": str(model_path) if model_path else None, "sha256": None}
-    payload = {"files": files, "parameters": asdict(parameters)}
+    payload = {
+        "files": files,
+        "parameters": asdict(parameters),
+        "execution": execution or {},
+    }
     payload["fingerprint_sha256"] = stable_json_hash(payload)
     return payload
 

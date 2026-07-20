@@ -42,10 +42,12 @@ The implementation is retained in its project-compatible path:
 0.scripts/gruneisen_anisotropy_calcu/
 ├── gruneisen_v2_core.py
 ├── run_gruneisen_thermal_expansion_v2.py
+├── symmetrize_thermal_expansion.py
 ├── batch_gruneisen_thermal_expansion_v2.py
 ├── select_v2_representatives.py
 ├── patch_mattersim_pr166.py
 ├── test_gruneisen_v2_core.py
+├── test_thermal_expansion_symmetry.py
 ├── ANISOTROPIC_GRUNEISEN_V2_DESIGN.md
 └── ANISOTROPIC_GRUNEISEN_V2_IMPLEMENTATION_STATUS.md
 ```
@@ -135,6 +137,32 @@ python 0.scripts/gruneisen_anisotropy_calcu/run_gruneisen_thermal_expansion_v2.p
 
 Production calculations should begin with the representative convergence set,
 including a second run at strain `0.0025`, before any full-dataset batch.
+
+## Crystal-symmetry post-processing
+
+After a production result has been selected, project the calculated Cartesian
+thermal-expansion tensor onto the point group of the actual reference structure
+(`reference/POSCAR`):
+
+```bash
+python 0.scripts/gruneisen_anisotropy_calcu/symmetrize_thermal_expansion.py \
+  --material-dir /path/to/material
+```
+
+For a batch result root containing numbered material directories:
+
+```bash
+python 0.scripts/gruneisen_anisotropy_calcu/symmetrize_thermal_expansion.py \
+  --results-root /path/to/results \
+  --batch-report /path/to/symmetry_postprocess_summary.json
+```
+
+The operation is non-destructive. It preserves
+`thermal_expansion_cartesian_raw.dat`, writes separate symmetrized Cartesian and
+crystallographic-axis tables, and records the removed symmetry residual in
+`thermal_expansion_symmetry_report.json`. If symmetry detection differs between
+`symprec=0.005` and the stricter `0.001` audit, the stricter point group is used.
+Large removed components are reported as warnings rather than silently accepted.
 
 ## Computational cost
 

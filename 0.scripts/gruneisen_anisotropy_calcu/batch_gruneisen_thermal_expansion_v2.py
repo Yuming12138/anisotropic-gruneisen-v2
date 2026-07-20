@@ -19,6 +19,7 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 RUNNER = SCRIPT_DIR / "run_gruneisen_thermal_expansion_v2.py"
+PRODUCTION_RUNNER = SCRIPT_DIR / "run_gruneisen_production_v2.py"
 DEFAULT_ROOTS = (PROJECT_ROOT / "NTE_materials", PROJECT_ROOT / "PTE_materials")
 
 
@@ -30,18 +31,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--python", type=Path, default=Path(sys.executable))
     parser.add_argument("--result-subdir", default="gruneisen_aniso_1M_v2")
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument("--production", action="store_true")
     parser.add_argument("--model", type=Path, default=None)
     parser.add_argument("--model-size", choices=("1M", "5M"), default="1M")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float64")
     parser.add_argument("--strain", type=float, default=0.005)
     parser.add_argument("--fallback-strain", type=float, default=0.0025)
+    parser.add_argument("--dense-mesh", type=int, nargs=3, default=(24, 24, 24))
     parser.add_argument("--displacement", type=float, default=0.01)
-    parser.add_argument("--mesh", type=int, nargs=3, default=(30, 30, 30))
+    parser.add_argument("--mesh", type=int, nargs=3, default=(20, 20, 20))
     parser.add_argument("--min-supercell-length", type=float, default=12.0)
     parser.add_argument("--supercell", type=int, nargs=3, default=None)
     parser.add_argument("--fmax", type=float, default=1.0e-3)
     parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--batch-relax", action="store_true")
+    parser.add_argument("--batch-relax-atom-cap", type=int, default=1024)
     parser.add_argument("--frequency-cutoff", type=float, default=1.0e-4)
     parser.add_argument("--tmin", type=float, default=10.0)
     parser.add_argument("--tmax", type=float, default=1000.0)
@@ -124,23 +129,47 @@ def safe_name(material_dir: Path) -> str:
 
 
 def runner_command(args: argparse.Namespace, material_dir: Path) -> list[str | Path]:
-    command: list[str | Path] = [
-        args.python,
-        RUNNER,
-        "--material-dir",
-        material_dir,
-        "--result-subdir",
-        args.result_subdir,
+    if args.production and not args.preflight_only:
+        command: list[str | Path] = [
+            args.python,
+            PRODUCTION_RUNNER,
+            "--material-dir",
+            material_dir,
+            "--result-subdir",
+            args.result_subdir,
+            "--python",
+            args.python,
+            "--primary-strain",
+            str(args.strain),
+            "--fallback-strain",
+            str(args.fallback_strain),
+            "--dense-mesh",
+            *[str(value) for value in args.dense_mesh],
+            "--batch-relax-atom-cap",
+            str(args.batch_relax_atom_cap),
+        ]
+        runner = command
+    else:
+        runner = [
+            args.python,
+            RUNNER,
+            "--material-dir",
+            material_dir,
+            "--result-subdir",
+            args.result_subdir,
+            "--strain",
+            str(args.strain),
+            "--fallback-strain",
+            str(args.fallback_strain),
+        ]
+    command = [
+        *runner,
         "--model-size",
         args.model_size,
         "--device",
         args.device,
         "--dtype",
         args.dtype,
-        "--strain",
-        str(args.strain),
-        "--fallback-strain",
-        str(args.fallback_strain),
         "--displacement",
         str(args.displacement),
         "--mesh",
@@ -176,10 +205,16 @@ def runner_command(args: argparse.Namespace, material_dir: Path) -> list[str | P
         command.append("--force")
     if args.skip_internal_relax:
         command.append("--skip-internal-relax")
+    if args.batch_relax and not args.production:
+        command.extend(
+            ["--batch-relax", "--batch-relax-atom-cap", str(args.batch_relax_atom_cap)]
+        )
     return command
 
 
-def run_command(command: list[str | Path], cwd: Path, log_path: Path, dry_run: bool) -> tuple[int, float]:
+def run_command(
+    command: list[str | Path], cwd: Path, log_path: Path, dry_run: bool
+) -> tuple[int, float]:
     if dry_run:
         print("DRY-RUN:", " ".join(str(value) for value in command))
         return 0, 0.0
@@ -242,11 +277,23 @@ def read_json_if_present(path: Path) -> dict[str, Any]:
         return {}
 
 
-def result_row(material_dir: Path, result_subdir: str) -> dict[str, Any]:
+def result_row(material_dir: Path, result_subdir: str, production: bool = False) -> dict[str, Any]:
     result_dir = material_dir / result_subdir
     preflight = read_json_if_present(result_dir / "preflight_report.json")
     quality = read_json_if_present(result_dir / "quality_report.json")
     complete = read_json_if_present(result_dir / "calculation_complete.json")
+    decision = read_json_if_present(result_dir / "production_decision.json") if production else {}
+    selected_result = result_dir
+    if decision:
+        selected_result = Path(
+            decision.get("selected_result")
+            or decision.get("fallback_result")
+            or decision.get("primary_result")
+            or result_dir
+        )
+        preflight = read_json_if_present(selected_result / "preflight_report.json")
+        quality = read_json_if_present(selected_result / "quality_report.json")
+        complete = read_json_if_present(selected_result / "calculation_complete.json")
     elastic = preflight.get("elastic", {})
     return {
         "root": material_dir.parent.name,
@@ -254,7 +301,7 @@ def result_row(material_dir: Path, result_subdir: str) -> dict[str, Any]:
         "material_dir": str(material_dir),
         "result_dir": str(result_dir),
         "preflight_status": preflight.get("status", "missing"),
-        "calc_status": complete.get("status", "not_complete"),
+        "calc_status": decision.get("status", complete.get("status", "not_complete")),
         "quality_status": "available" if quality else "not_available",
         "elastic_positive_definite": elastic.get("positive_definite", ""),
         "elastic_min_eigenvalue_GPa": elastic.get("min_eigenvalue_GPa", ""),
@@ -270,13 +317,25 @@ def result_row(material_dir: Path, result_subdir: str) -> dict[str, Any]:
             if quality.get("strained_imaginary_diagnostics")
             else ""
         ),
-        "strain_converged": quality.get("strain_convergence_status", ""),
+        "strain_converged": (
+            (decision.get("strain_convergence") or {}).get("status", "not_required")
+            if decision
+            else quality.get("strain_convergence_status", "")
+        ),
+        "mesh_converged": (
+            (decision.get("mesh_convergence") or {}).get("status", "not_required")
+            if decision
+            else ""
+        ),
         "effective_isotropy_status": quality.get("effective_isotropy_screen", {}).get("status", ""),
         "Fani_max": quality.get("effective_isotropy_screen", {}).get("fani_max", ""),
         "fingerprint_sha256": preflight.get("fingerprint", {}).get("fingerprint_sha256", ""),
         "issues": ";".join(preflight.get("issues", [])),
-        "metadata_path": str(result_dir / "run_metadata.json"),
-        "quality_report_path": str(result_dir / "quality_report.json"),
+        "metadata_path": str(selected_result / "run_metadata.json"),
+        "quality_report_path": str(selected_result / "quality_report.json"),
+        "production_decision_path": str(result_dir / "production_decision.json"),
+        "mesh_check_result": decision.get("mesh_check_result", "") if decision else "",
+        "fallback_used": bool(decision.get("fallback_result")) if decision else "",
         "log_path": "",
         "seconds": "",
         "runner_returncode": "",
@@ -314,7 +373,11 @@ def main(argv: list[str] | None = None) -> None:
                 log_path,
                 args.dry_run,
             )
-        row = result_row(material_dir, args.result_subdir)
+        row = result_row(
+            material_dir,
+            args.result_subdir,
+            production=args.production and not args.preflight_only,
+        )
         row["log_path"] = str(log_path)
         row["seconds"] = f"{seconds:.2f}"
         row["runner_returncode"] = code

@@ -33,6 +33,7 @@ from pymatgen.core import Structure
 
 from gruneisen_v2_core import (
     V2Parameters,
+    assess_production_readiness,
     apply_engineering_strain,
     choose_supercell_matrix,
     compute_thermal_response,
@@ -53,6 +54,13 @@ SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
 CORE_PATH = SCRIPT_DIR / "gruneisen_v2_core.py"
 DEFAULT_RESULT_SUBDIR = "gruneisen_aniso_1M_v2"
+COMPLETE_ARTIFACTS = (
+    "quality_report.json",
+    "run_metadata.json",
+    "thermal_expansion_cartesian.dat",
+    "thermal_expansion_directional.dat",
+    "gruneisen_integrals.dat",
+)
 MODEL_FILENAMES = {
     "1M": "mattersim-v1.0.0-1M.pth",
     "5M": "mattersim-v1.0.0-5M.pth",
@@ -71,11 +79,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--strain", type=float, default=0.005)
     parser.add_argument("--fallback-strain", type=float, default=0.0025)
     parser.add_argument("--displacement", type=float, default=0.01)
-    parser.add_argument("--mesh", type=int, nargs=3, default=(30, 30, 30))
+    parser.add_argument("--mesh", type=int, nargs=3, default=(20, 20, 20))
     parser.add_argument("--min-supercell-length", type=float, default=12.0)
     parser.add_argument("--supercell", type=int, nargs=3, default=None)
     parser.add_argument("--fmax", type=float, default=1.0e-3)
     parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--batch-relax", action="store_true")
+    parser.add_argument("--batch-relax-atom-cap", type=int, default=1024)
     parser.add_argument("--frequency-cutoff", type=float, default=1.0e-4)
     parser.add_argument("--tmin", type=float, default=10.0)
     parser.add_argument("--tmax", type=float, default=1000.0)
@@ -99,6 +109,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("mesh values must be positive")
     if args.tmax < args.tmin or args.tstep <= 0.0:
         raise SystemExit("invalid temperature range")
+    if args.batch_relax_atom_cap <= 0:
+        raise SystemExit("--batch-relax-atom-cap must be positive")
     if not 0.0 <= args.fani_threshold <= 1.0:
         raise SystemExit("--fani-threshold must be between 0 and 1")
     if args.sign_tolerance_micro < 0.0:
@@ -237,6 +249,135 @@ def fixed_cell_relax(
     return relaxed, report
 
 
+def batch_fixed_cell_relax(
+    states: list[tuple[str, Atoms, Path]],
+    potential: Any,
+    fmax: float,
+    max_steps: int,
+    max_natoms_per_batch: int,
+) -> dict[str, tuple[Atoms, dict[str, Any]]]:
+    from mattersim.applications.batch_relax import BatchRelaxer, DummyBatchCalculator
+    from mattersim.datasets.utils.build import build_dataloader
+
+    class FixedCellBatchRelaxer(BatchRelaxer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.max_steps_reached: list[int] = []
+
+        def insert(self, atoms: Atoms) -> None:
+            atoms.calc = DummyBatchCalculator()
+            optimizer = self.optimizer(atoms, logfile=None, maxstep=0.1)
+            optimizer.fmax = self.fmax
+            optimizer.nsteps = 0
+            self.optimizer_instances.append(optimizer)
+            self.is_active_instance.append(True)
+
+        def step_batch(self) -> None:
+            active_optimizers = [
+                optimizer
+                for optimizer, active in zip(
+                    self.optimizer_instances, self.is_active_instance
+                )
+                if active
+            ]
+            if not active_optimizers:
+                self.finished = True
+                return
+            dataloader = build_dataloader(
+                [optimizer.atoms for optimizer in active_optimizers],
+                batch_size=len(active_optimizers),
+                only_inference=True,
+                batch_converter=False,
+            )
+            energies, forces, _ = self.potential.predict_properties(
+                dataloader,
+                include_forces=True,
+                include_stresses=False,
+            )
+
+            counter = 0
+            self.finished = True
+            for index, optimizer in enumerate(self.optimizer_instances):
+                if not self.is_active_instance[index]:
+                    continue
+                optimizer.atoms.info["total_energy"] = energies[counter]
+                optimizer.atoms.arrays["forces"] = forces[counter]
+                structure_index = int(optimizer.atoms.info["structure_index"])
+                self.trajectories.setdefault(structure_index, []).append(
+                    optimizer.atoms.copy()
+                )
+                gradient = optimizer.optimizable.get_gradient()
+                if optimizer.converged(gradient):
+                    self.is_active_instance[index] = False
+                    self.total_converged += 1
+                elif optimizer.nsteps >= self.max_n_steps:
+                    self.is_active_instance[index] = False
+                    self.max_steps_reached.append(structure_index)
+                else:
+                    optimizer.step()
+                    optimizer.nsteps += 1
+                    self.finished = False
+                counter += 1
+
+            self.optimizer_instances = [
+                optimizer
+                for optimizer, active in zip(
+                    self.optimizer_instances, self.is_active_instance
+                )
+                if active
+            ]
+            self.is_active_instance = [True] * len(self.optimizer_instances)
+
+    if not states:
+        return {}
+    largest_state = max(len(atoms) for _, atoms, _ in states)
+    if largest_state > max_natoms_per_batch:
+        raise ValueError(
+            f"batch_relax_atom_cap_too_small:{largest_state}>{max_natoms_per_batch}"
+        )
+    for _, atoms, run_dir in states:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        write(run_dir / "POSCAR_unrelaxed", atoms, format="vasp", direct=True, vasp5=True)
+
+    relaxer = FixedCellBatchRelaxer(
+        potential,
+        optimizer="BFGS",
+        filter=None,
+        fmax=fmax,
+        max_natoms_per_batch=max_natoms_per_batch,
+        max_n_steps=max_steps,
+    )
+    trajectories = relaxer.relax([atoms for _, atoms, _ in states])
+    results: dict[str, tuple[Atoms, dict[str, Any]]] = {}
+    for index, (state_name, _, run_dir) in enumerate(states):
+        trajectory = trajectories[index]
+        relaxed = trajectory[-1].copy()
+        relaxed.calc = DummyBatchCalculator()
+        forces = np.asarray(relaxed.get_forces(), dtype=float)
+        converged = index not in relaxer.max_steps_reached
+        report = {
+            "status": "converged" if converged else "max_steps_reached",
+            "method": "fixed_cell_batch_bfgs",
+            "steps": max(0, len(trajectory) - 1),
+            "energy_eV": float(relaxed.get_potential_energy()),
+            "max_force_eV_A": (
+                float(np.max(np.linalg.norm(forces, axis=1))) if len(forces) else 0.0
+            ),
+            "atom_count": len(relaxed),
+            "symbols": relaxed.get_chemical_symbols(),
+            "volume_A3": float(relaxed.get_volume()),
+            "batch_relax_atom_cap": max_natoms_per_batch,
+        }
+        write(run_dir / "CONTCAR", relaxed, format="vasp", direct=True, vasp5=True)
+        write_json(run_dir / "internal_relax_report.json", report)
+        (run_dir / "internal_relax.log").write_text(
+            json.dumps(report, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        results[state_name] = relaxed, report
+    return results
+
+
 def calculate_force_constants(
     atoms: Atoms,
     calculator: Any,
@@ -334,20 +475,46 @@ def build_parameters(args: argparse.Namespace) -> V2Parameters:
 def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     material_dir = args.material_dir.expanduser().resolve()
     result_dir = material_dir / args.result_subdir
-    root_poscar = material_dir / "POSCAR"
+    original_root_poscar = material_dir / "POSCAR"
+    root_poscar = original_root_poscar
     elastic_dir = material_dir / "elastic"
     elastic_poscar = elastic_dir / "POSCAR"
     elastic_tensor = elastic_dir / "ELASTIC_TENSOR"
-    required = (root_poscar, elastic_poscar, elastic_tensor)
+    required = (original_root_poscar, elastic_poscar, elastic_tensor)
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError("missing_required_inputs:" + ";".join(missing))
 
-    root_structure = Structure.from_file(root_poscar)
+    root_structure = Structure.from_file(original_root_poscar)
     elastic_structure = Structure.from_file(elastic_poscar)
     C_raw = read_elastic_tensor(elastic_tensor)
     C, elastic_report = validate_elastic_tensor(C_raw)
     axis_mapping = structure_axis_mapping(root_structure, elastic_structure)
+    axis_structure_source = "material_root_poscar"
+    if axis_mapping["status"] != "ok":
+        optimized_poscar = material_dir / "opt" / "CONTCAR"
+        if optimized_poscar.is_file():
+            optimized_structure = Structure.from_file(optimized_poscar)
+            optimized_mapping = structure_axis_mapping(
+                optimized_structure, elastic_structure
+            )
+            formula_matches = (
+                optimized_structure.composition.reduced_composition
+                == elastic_structure.composition.reduced_composition
+            )
+            atom_count_matches = len(optimized_structure) == len(elastic_structure)
+            if (
+                optimized_mapping["status"] == "ok"
+                and formula_matches
+                and atom_count_matches
+            ):
+                root_poscar = optimized_poscar
+                root_structure = optimized_structure
+                axis_mapping = optimized_mapping
+                axis_structure_source = "optimized_structure_fallback"
+    axis_mapping["structure_source"] = axis_structure_source
+    axis_mapping["structure_path"] = str(root_poscar)
+    axis_mapping["original_root_poscar"] = str(original_root_poscar)
     if args.supercell is None:
         supercell = choose_supercell_matrix(
             elastic_structure.lattice.matrix,
@@ -360,6 +527,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
 
     model_path = resolve_model_path(args.model, args.model_size)
     parameters = build_parameters(args)
+    versions = runtime_versions()
     fingerprint = input_fingerprint(
         root_poscar=root_poscar,
         elastic_poscar=elastic_poscar,
@@ -368,8 +536,28 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
         parameters=parameters,
         runner_path=SCRIPT_PATH,
         core_path=CORE_PATH,
+        execution={
+            "supercell_matrix": supercell.tolist(),
+            "device": args.device,
+            "internal_relax_method": (
+                "skipped"
+                if args.skip_internal_relax
+                else (
+                    "fixed_cell_batch_bfgs"
+                    if args.batch_relax
+                    else "fixed_cell_sequential_bfgs"
+                )
+            ),
+            "batch_relax_atom_cap": (
+                args.batch_relax_atom_cap if args.batch_relax else None
+            ),
+            "runtime_versions": versions,
+        },
     )
-    formula_match = root_structure.composition.reduced_composition == elastic_structure.composition.reduced_composition
+    formula_match = (
+        root_structure.composition.reduced_composition
+        == elastic_structure.composition.reduced_composition
+    )
     atom_count_match = len(root_structure) == len(elastic_structure)
     issues = []
     if not formula_match:
@@ -396,6 +584,8 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
             "root_elastic_atom_count_mismatch",
             "elastic_not_positive_definite",
             "elastic_ill_conditioned",
+            "cte_axis_to_elastic_lattice_mapping_failed",
+            "mattersim_model_missing_in_current_environment",
         }
     ]
     report = {
@@ -407,6 +597,8 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
         "blocking_issues": blocking,
         "issues": issues,
         "root_poscar": str(root_poscar),
+        "original_root_poscar": str(original_root_poscar),
+        "axis_structure_source": axis_structure_source,
         "elastic_poscar": str(elastic_poscar),
         "elastic_tensor": str(elastic_tensor),
         "root_formula": root_structure.composition.reduced_formula,
@@ -418,13 +610,16 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
         "supercell_matrix": supercell.tolist(),
         "supercell_source": supercell_source,
         "supercell_lengths_A": (
-            np.linalg.norm(np.asarray(elastic_structure.lattice.matrix) * np.diag(supercell)[:, None], axis=1)
+            np.linalg.norm(
+                np.asarray(elastic_structure.lattice.matrix) * np.diag(supercell)[:, None],
+                axis=1,
+            )
         ).tolist(),
         "model_path": str(model_path),
         "model_present": model_path.is_file(),
         "parameters": asdict(parameters),
         "fingerprint": fingerprint,
-        "runtime_versions": runtime_versions(),
+        "runtime_versions": versions,
     }
     context = {
         "material_dir": material_dir,
@@ -482,7 +677,24 @@ def write_preflight_outputs(report: dict[str, Any], context: dict[str, Any]) -> 
     )
 
 
-def run_gruneisen(args: argparse.Namespace, report: dict[str, Any], context: dict[str, Any]) -> None:
+def completed_result_matches(result_dir: Path, fingerprint_sha256: str) -> bool:
+    complete_path = result_dir / "calculation_complete.json"
+    if not complete_path.is_file():
+        return False
+    try:
+        complete = json.loads(complete_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if complete.get("status") != "complete":
+        return False
+    if complete.get("fingerprint_sha256") != fingerprint_sha256:
+        return False
+    return all((result_dir / name).is_file() for name in COMPLETE_ARTIFACTS)
+
+
+def run_gruneisen(
+    args: argparse.Namespace, report: dict[str, Any], context: dict[str, Any]
+) -> None:
     if report["blocking_issues"]:
         raise RuntimeError("preflight_blocked:" + ";".join(report["blocking_issues"]))
     model_path: Path = context["model_path"]
@@ -514,6 +726,10 @@ def run_gruneisen(args: argparse.Namespace, report: dict[str, Any], context: dic
         "primitive_matrix": np.eye(3).tolist(),
         "model_sha256": sha256_file(model_path),
         "dtype": args.dtype,
+        "internal_relax_method": (
+            "fixed_cell_batch_bfgs" if args.batch_relax else "fixed_cell_sequential_bfgs"
+        ),
+        "batch_relax_atom_cap": args.batch_relax_atom_cap if args.batch_relax else None,
     }
 
     print("[v2] reference force constants", flush=True)
@@ -528,40 +744,67 @@ def run_gruneisen(args: argparse.Namespace, report: dict[str, Any], context: dic
         force=args.force,
     )
 
-    strained_phonons: dict[tuple[int, int], Phonopy] = {}
-    relax_reports: dict[str, Any] = {}
+    state_specs: list[tuple[int, int, float, str, Atoms, Path]] = []
     for component in range(1, 7):
         for sign, tag in ((-1, "minus"), (1, "plus")):
             amplitude = sign * parameters.strain
             state_name = f"eta{component}_{tag}"
             print(f"[v2] {state_name}: engineering strain {amplitude:+.6f}", flush=True)
             strained = apply_engineering_strain(reference_atoms, component, amplitude)
-            relaxed, relax_report = fixed_cell_relax(
+            state_specs.append(
+                (component, sign, amplitude, state_name, strained, work_dir / state_name)
+            )
+
+    if args.batch_relax and not args.skip_internal_relax:
+        print(
+            f"[v2] batch relaxing {len(state_specs)} strained states "
+            f"with atom cap {args.batch_relax_atom_cap}",
+            flush=True,
+        )
+        relaxed_states = batch_fixed_cell_relax(
+            [
+                (state_name, strained, run_dir)
+                for _, _, _, state_name, strained, run_dir in state_specs
+            ],
+            calculator.potential,
+            fmax=parameters.internal_relax_fmax_eV_A,
+            max_steps=parameters.internal_relax_max_steps,
+            max_natoms_per_batch=args.batch_relax_atom_cap,
+        )
+    else:
+        relaxed_states = {}
+        for _, _, _, state_name, strained, run_dir in state_specs:
+            relaxed_states[state_name] = fixed_cell_relax(
                 strained,
                 calculator,
-                work_dir / state_name,
+                run_dir,
                 fmax=parameters.internal_relax_fmax_eV_A,
                 max_steps=parameters.internal_relax_max_steps,
                 skip=args.skip_internal_relax,
             )
-            if relaxed.get_chemical_symbols() != reference_atoms.get_chemical_symbols():
-                raise RuntimeError(f"atom_order_changed:{state_name}")
-            relax_reports[state_name] = relax_report
-            strained_phonons[(component, sign)] = calculate_force_constants(
-                atoms=relaxed,
-                calculator=calculator,
-                run_dir=work_dir / state_name,
-                supercell_matrix=context["supercell_matrix"],
-                displacement_A=parameters.displacement_A,
-                state_fingerprint={
-                    **common_state,
-                    "component": component,
-                    "strain": amplitude,
-                    "relaxed_structure_sha256": sha256_file(work_dir / state_name / "CONTCAR"),
-                },
-                resume=args.resume,
-                force=args.force,
-            )
+
+    strained_phonons: dict[tuple[int, int], Phonopy] = {}
+    relax_reports: dict[str, Any] = {}
+    for component, sign, amplitude, state_name, _, run_dir in state_specs:
+        relaxed, relax_report = relaxed_states[state_name]
+        if relaxed.get_chemical_symbols() != reference_atoms.get_chemical_symbols():
+            raise RuntimeError(f"atom_order_changed:{state_name}")
+        relax_reports[state_name] = relax_report
+        strained_phonons[(component, sign)] = calculate_force_constants(
+            atoms=relaxed,
+            calculator=calculator,
+            run_dir=run_dir,
+            supercell_matrix=context["supercell_matrix"],
+            displacement_A=parameters.displacement_A,
+            state_fingerprint={
+                **common_state,
+                "component": component,
+                "strain": amplitude,
+                "relaxed_structure_sha256": sha256_file(run_dir / "CONTCAR"),
+            },
+            resume=args.resume,
+            force=args.force,
+        )
 
     gammas = []
     qpoints_ref = None
@@ -651,6 +894,7 @@ def run_gruneisen(args: argparse.Namespace, report: dict[str, Any], context: dic
             "effective_isotropy_screen": effective_screen,
         }
     )
+    quality["production_readiness"] = assess_production_readiness(quality)
     write_json(result_dir / "quality_report.json", quality)
 
     T = response["temperatures_K"]
@@ -658,7 +902,16 @@ def run_gruneisen(args: argparse.Namespace, report: dict[str, Any], context: dic
     cartesian_rows = np.column_stack([T, alpha_micro, response["alpha_volume_per_K"] * 1.0e6])
     (result_dir / "thermal_expansion_cartesian.dat").write_text(
         rows_to_text_table(
-            ["T_K", "alpha_xx", "alpha_yy", "alpha_zz", "alpha_yz_eng", "alpha_xz_eng", "alpha_xy_eng", "alpha_volume"],
+            [
+                "T_K",
+                "alpha_xx",
+                "alpha_yy",
+                "alpha_zz",
+                "alpha_yz_eng",
+                "alpha_xz_eng",
+                "alpha_xy_eng",
+                "alpha_volume",
+            ],
             cartesian_rows,
         ),
         encoding="utf-8",
@@ -714,6 +967,10 @@ def run_gruneisen(args: argparse.Namespace, report: dict[str, Any], context: dic
             "runtime_versions": runtime_versions(),
             "model_path": str(model_path),
             "model_sha256": sha256_file(model_path),
+            "internal_relaxation": {
+                "method": common_state["internal_relax_method"],
+                "batch_relax_atom_cap": common_state["batch_relax_atom_cap"],
+            },
         }
     )
     write_json(result_dir / "run_metadata.json", metadata)
@@ -737,6 +994,11 @@ def main(argv: list[str] | None = None) -> None:
     if report["issues"]:
         print("issues: " + ";".join(report["issues"]))
     if args.preflight_only:
+        return
+    if args.resume and not args.force and completed_result_matches(
+        context["result_dir"], context["fingerprint"]["fingerprint_sha256"]
+    ):
+        print(f"resume_complete: {context['result_dir']}")
         return
     run_gruneisen(args, report, context)
     print(f"complete: {context['result_dir']}")
