@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,12 @@ from ase import Atoms
 from ase.io import write
 
 from compare_alpha_split_runs import load_alpha_split_table
+from plot_alpha_split_results import (
+    ALPHA_SPLIT_PNG,
+    PLOT_METADATA_JSON,
+    QHA_COMPARISON_PNG,
+    generate_result_plots,
+)
 from run_compliance_weighted_alpha_split import (
     assess_split_readiness,
     completed_result_matches,
@@ -69,6 +76,45 @@ class AlphaSplitContractTests(unittest.TestCase):
             self.assertEqual(before, sha256_file(tensor))
             self.assertTrue((material / "probe" / "effective_strain_path.json").is_file())
             self.assertTrue((material / "probe" / "reference" / "POSCAR").is_file())
+
+    def test_preflight_uses_elastic_structure_and_audits_original_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            material, model = self.make_material(Path(temporary))
+            optimized = material / "opt"
+            optimized.mkdir()
+            elastic_atoms = Atoms(
+                "NaCl",
+                cell=np.eye(3) * 5.6,
+                scaled_positions=[[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]],
+                pbc=True,
+            )
+            changed_root = elastic_atoms.copy()
+            changed_root.set_cell(np.diag([8.0, 5.6, 5.6]), scale_atoms=False)
+            write(material / "POSCAR", changed_root, format="vasp", direct=True, vasp5=True)
+            write(optimized / "CONTCAR", elastic_atoms, format="vasp", direct=True, vasp5=True)
+            args = parse_args(
+                [
+                    "--material-dir",
+                    str(material),
+                    "--result-subdir",
+                    "probe",
+                    "--model",
+                    str(model),
+                    "--preflight-only",
+                ]
+            )
+            report, context = preflight(args)
+            self.assertEqual(report["phase_consistency"]["status"], "ok")
+            self.assertEqual(report["structure_source"], "elastic_poscar")
+            self.assertEqual(
+                report["original_phase_consistency"]["status"],
+                "root_elastic_phase_mismatch",
+            )
+            self.assertIn("original_root_elastic_phase_mismatch", report["issues"])
+            write_preflight_outputs(report, context)
+            self.assertTrue(
+                (material / "probe" / "reference" / "ORIGINAL_ROOT_POSCAR").is_file()
+            )
 
     def test_completed_result_requires_matching_fingerprint_and_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -160,6 +206,77 @@ class AlphaSplitContractTests(unittest.TestCase):
             self.assertAlmostEqual(float(loaded["alpha_volume_positive_per_K"][0]), 10.0e-6)
             self.assertAlmostEqual(float(loaded["ratio_upper_bound"][0]), 0.52)
             self.assertAlmostEqual(float(loaded["unresolved_alpha_fraction"][0]), 0.01)
+
+    def test_plotter_creates_split_and_qha_comparison_pngs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            material = Path(temporary) / "0090"
+            result = material / "compliance_weighted_alpha_split" / "selected_300K"
+            qha_dir = material / "thermal_expansion" / "thermal_properties"
+            result.mkdir(parents=True)
+            qha_dir.mkdir(parents=True)
+            temperatures = np.asarray([10.0, 300.0, 1000.0])
+            positive = np.asarray([0.1, 10.0, 14.0])
+            negative = np.asarray([-0.2, -6.0, -8.0])
+            total = positive + negative
+            rows = np.column_stack(
+                [
+                    temperatures,
+                    positive,
+                    negative,
+                    np.abs(negative),
+                    np.zeros(3),
+                    np.zeros(3),
+                    total,
+                    np.abs(negative) / positive,
+                    np.abs(negative) / positive,
+                    np.abs(negative) / positive,
+                    np.zeros(3),
+                    np.zeros(3),
+                    np.zeros(3),
+                ]
+            )
+            np.savetxt(result / "alpha_volume_split.dat", rows)
+            write_json(
+                result / "alpha_volume_split_target.json",
+                {"validity_scope": "300K_only"},
+            )
+            np.savetxt(
+                qha_dir / "thermal_expansion.dat",
+                np.column_stack([temperatures, total * 1.0e-6]),
+            )
+
+            report = generate_result_plots(result, material_dir=material, dpi=80)
+
+            self.assertEqual(report["status"], "complete")
+            for name in (ALPHA_SPLIT_PNG, QHA_COMPARISON_PNG):
+                image = result / name
+                self.assertTrue(image.is_file())
+                self.assertEqual(image.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+            metadata = json.loads(
+                (result / PLOT_METADATA_JSON).read_text(encoding="utf-8")
+            )
+            self.assertEqual(metadata["validity_scope"], "300K_only")
+            self.assertEqual(
+                metadata["volumetric_identity"],
+                "alpha_V=trace(alpha_Cartesian)=alpha_xx+alpha_yy+alpha_zz",
+            )
+
+    def test_plotter_keeps_split_png_when_qha_is_missing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            material = Path(temporary) / "0001"
+            result = material / "result"
+            result.mkdir(parents=True)
+            row = np.asarray(
+                [[300.0, 10.0, -5.0, 5.0, 0.0, 0.0, 5.0, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0]]
+            )
+            np.savetxt(result / "alpha_volume_split.dat", row)
+
+            report = generate_result_plots(result, material_dir=material, dpi=80)
+
+            self.assertEqual(report["status"], "partial")
+            self.assertTrue((result / ALPHA_SPLIT_PNG).is_file())
+            self.assertFalse((result / QHA_COMPARISON_PNG).exists())
+            self.assertIn("qha_thermal_expansion_not_found", report["warnings"])
 
 
 if __name__ == "__main__":

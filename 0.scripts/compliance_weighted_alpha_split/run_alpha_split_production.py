@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import shutil
 import subprocess
@@ -13,6 +14,12 @@ from typing import Any
 
 from alpha_split_core import compare_split_responses
 from compare_alpha_split_runs import load_alpha_split_table
+from plot_alpha_split_results import (
+    ALPHA_SPLIT_PNG,
+    PLOT_METADATA_JSON,
+    QHA_COMPARISON_PNG,
+    generate_result_plots,
+)
 from v2_runtime_adapter import write_json
 
 
@@ -61,6 +68,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-internal-relax", action="store_true")
+    parser.add_argument("--skip-plots", action="store_true")
+    parser.add_argument("--qha-thermal-expansion", type=Path, default=None)
+    parser.add_argument("--plot-dpi", type=int, default=200)
     args = parser.parse_args(argv)
     result = Path(args.result_subdir)
     if result.is_absolute() or ".." in result.parts:
@@ -71,6 +81,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--fallback-strain must be smaller than --primary-strain")
     if args.max_internal_relax_displacement <= 0.0:
         raise SystemExit("--max-internal-relax-displacement must be positive")
+    if args.plot_dpi <= 0:
+        raise SystemExit("--plot-dpi must be positive")
     if args.minimum_reportable_contribution_micro < 0.0:
         raise SystemExit("--minimum-reportable-contribution-micro must be non-negative")
     for value, label in (
@@ -161,6 +173,13 @@ def runner_command(
         command.append("--force")
     if args.skip_internal_relax:
         command.append("--skip-internal-relax")
+    if args.skip_plots:
+        command.append("--skip-plots")
+    if args.qha_thermal_expansion is not None:
+        command.extend(
+            ["--qha-thermal-expansion", str(args.qha_thermal_expansion)]
+        )
+    command.extend(["--plot-dpi", str(args.plot_dpi)])
     return command
 
 
@@ -174,6 +193,33 @@ def run_stage(command: list[str], log_path: Path) -> None:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def update_production_plots(
+    args: argparse.Namespace,
+    material_dir: Path,
+    result_dir: Path,
+) -> dict[str, Any] | None:
+    if args.skip_plots:
+        return None
+    try:
+        return generate_result_plots(
+            result_dir,
+            material_dir=material_dir,
+            qha_thermal_expansion=args.qha_thermal_expansion,
+            target_temperature_K=float(args.target_temperature),
+            dpi=int(args.plot_dpi),
+        )
+    except Exception as error:
+        report = {
+            "schema_version": 1,
+            "status": "failed",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "failure": f"{type(error).__name__}:{error}",
+        }
+        write_json(result_dir / PLOT_METADATA_JSON, report)
+        print(f"[alpha-split-production] plotting warning: {report['failure']}")
+        return report
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -200,6 +246,9 @@ def main(argv: list[str] | None = None) -> None:
         "preflight_report.json",
         "run_metadata.json",
         "strain_convergence.json",
+        ALPHA_SPLIT_PNG,
+        QHA_COMPARISON_PNG,
+        PLOT_METADATA_JSON,
     ):
         published = base_dir / name
         if published.exists():
@@ -302,6 +351,7 @@ def main(argv: list[str] | None = None) -> None:
             write_json(base_dir / "alpha_volume_split_target.json", target)
             if abs(float(args.target_temperature) - 300.0) < 1.0e-8:
                 write_json(base_dir / "alpha_volume_split_300K.json", target)
+            plot_report = update_production_plots(args, material_dir, base_dir)
             fallback_complete = read_json(fallback_dir / "calculation_complete.json")
             write_json(
                 base_dir / "production_complete.json",
@@ -312,6 +362,11 @@ def main(argv: list[str] | None = None) -> None:
                         "fingerprint_sha256"
                     ),
                     "strain_convergence": str(base_dir / "strain_convergence.json"),
+                    "plot_metadata": (
+                        str(base_dir / PLOT_METADATA_JSON)
+                        if plot_report is not None
+                        else None
+                    ),
                 },
             )
         else:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import shutil
@@ -25,6 +26,12 @@ from alpha_split_core import (
     compute_alpha_volume_split,
     path_state_report,
     summarize_at_temperature,
+)
+from plot_alpha_split_results import (
+    ALPHA_SPLIT_PNG,
+    PLOT_METADATA_JSON,
+    QHA_COMPARISON_PNG,
+    generate_result_plots,
 )
 from v2_runtime_adapter import (
     DiagnosticGruneisenMesh,
@@ -96,6 +103,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-internal-relax", action="store_true")
+    parser.add_argument("--skip-plots", action="store_true")
+    parser.add_argument("--qha-thermal-expansion", type=Path, default=None)
+    parser.add_argument("--plot-dpi", type=int, default=200)
     args = parser.parse_args(argv)
 
     result_subdir = Path(args.result_subdir)
@@ -121,6 +131,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--batch-relax-atom-cap must be positive")
     if args.max_internal_relax_displacement <= 0.0:
         raise SystemExit("--max-internal-relax-displacement must be positive")
+    if args.plot_dpi <= 0:
+        raise SystemExit("--plot-dpi must be positive")
     grid_position = (args.target_temperature - args.tmin) / args.tstep
     if (
         args.target_temperature < args.tmin
@@ -238,25 +250,51 @@ def relaxation_branch_report(
 def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     material_dir = args.material_dir.expanduser().resolve()
     result_dir = material_dir / args.result_subdir
-    root_poscar = material_dir / "POSCAR"
+    original_root_poscar = material_dir / "POSCAR"
     elastic_dir = material_dir / "elastic"
     elastic_poscar = elastic_dir / "POSCAR"
     elastic_tensor = elastic_dir / "ELASTIC_TENSOR"
     missing = [
         str(path)
-        for path in (root_poscar, elastic_poscar, elastic_tensor)
+        for path in (original_root_poscar, elastic_poscar, elastic_tensor)
         if not path.is_file()
     ]
     if missing:
         raise FileNotFoundError("missing_required_inputs:" + ";".join(missing))
 
-    root_structure = Structure.from_file(root_poscar)
+    original_root_structure = Structure.from_file(original_root_poscar)
     elastic_structure = Structure.from_file(elastic_poscar)
     stiffness_raw = read_elastic_tensor(elastic_tensor)
     stiffness, elastic_report = validate_elastic_tensor(stiffness_raw)
     compliance = np.linalg.inv(stiffness) if elastic_report["positive_definite"] else None
-    phase_report = strict_phase_match(root_structure, elastic_structure)
-    axis_mapping = structure_axis_mapping(root_structure, elastic_structure)
+    original_phase_report = strict_phase_match(
+        original_root_structure, elastic_structure
+    )
+    original_axis_mapping = structure_axis_mapping(
+        original_root_structure, elastic_structure
+    )
+    optimized_poscar = material_dir / "opt" / "CONTCAR"
+    if optimized_poscar.is_file():
+        optimized_structure = Structure.from_file(optimized_poscar)
+        optimized_phase_report = strict_phase_match(
+            optimized_structure, elastic_structure
+        )
+        optimized_axis_mapping = structure_axis_mapping(
+            optimized_structure, elastic_structure
+        )
+    else:
+        optimized_phase_report = {"status": "optimized_structure_missing"}
+        optimized_axis_mapping = {"status": "optimized_structure_missing"}
+    root_poscar = elastic_poscar
+    phase_report = strict_phase_match(elastic_structure, elastic_structure)
+    axis_mapping = structure_axis_mapping(elastic_structure, elastic_structure)
+    structure_source = "elastic_poscar"
+    phase_report["structure_source"] = structure_source
+    phase_report["structure_path"] = str(root_poscar)
+    phase_report["original_root_poscar"] = str(original_root_poscar)
+    axis_mapping["structure_source"] = structure_source
+    axis_mapping["structure_path"] = str(root_poscar)
+    axis_mapping["original_root_poscar"] = str(original_root_poscar)
     path = compliance_weighted_path(compliance) if compliance is not None else None
     states = path_state_report(path, args.strain) if path is not None else None
 
@@ -278,10 +316,14 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
         issues.append("elastic_not_positive_definite")
     if elastic_report["ill_conditioned"]:
         issues.append("elastic_ill_conditioned")
-    if phase_report["status"] != "ok":
-        issues.append(phase_report["status"])
-    if axis_mapping["status"] != "ok":
-        issues.append(axis_mapping["status"])
+    if original_phase_report["status"] != "ok":
+        issues.append("original_root_elastic_phase_mismatch")
+    if original_axis_mapping["status"] != "ok":
+        issues.append("original_root_elastic_axis_mapping_failed")
+    if optimized_poscar.is_file() and optimized_phase_report["status"] != "ok":
+        issues.append("optimized_elastic_phase_mismatch")
+    if optimized_poscar.is_file() and optimized_axis_mapping["status"] != "ok":
+        issues.append("optimized_elastic_axis_mapping_failed")
     if not model_path.is_file():
         issues.append("mattersim_model_missing_in_current_environment")
     if not (elastic_dir / "calculation_metadata.json").is_file():
@@ -293,7 +335,6 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
     blocking_names = {
         "elastic_not_positive_definite",
         "elastic_ill_conditioned",
-        "root_elastic_phase_mismatch",
         "mattersim_model_missing_in_current_environment",
         "nonpositive_path_deformation_determinant",
     }
@@ -332,7 +373,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
         "runtime_versions": versions,
     }
     fingerprint = input_fingerprint(
-        root_poscar=root_poscar,
+        root_poscar=elastic_poscar,
         elastic_poscar=elastic_poscar,
         elastic_tensor=elastic_tensor,
         model_path=model_path if model_path.is_file() else None,
@@ -351,10 +392,17 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
         "blocking_issues": blocking,
         "issues": issues,
         "root_poscar": str(root_poscar),
+        "original_root_poscar": str(original_root_poscar),
+        "structure_source": structure_source,
         "elastic_poscar": str(elastic_poscar),
         "elastic_tensor": str(elastic_tensor),
         "phase_consistency": phase_report,
+        "original_phase_consistency": original_phase_report,
+        "optimized_poscar": str(optimized_poscar),
+        "optimized_phase_consistency": optimized_phase_report,
         "axis_mapping": axis_mapping,
+        "original_axis_mapping": original_axis_mapping,
+        "optimized_axis_mapping": optimized_axis_mapping,
         "elastic": elastic_report,
         "effective_strain_path": path,
         "path_states": states,
@@ -385,6 +433,7 @@ def preflight(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]
         "material_dir": material_dir,
         "result_dir": result_dir,
         "root_poscar": root_poscar,
+        "original_root_poscar": original_root_poscar,
         "elastic_poscar": elastic_poscar,
         "elastic_tensor": elastic_tensor,
         "stiffness_GPa": stiffness,
@@ -407,6 +456,9 @@ def write_preflight_outputs(report: dict[str, Any], context: dict[str, Any]) -> 
     reference_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(context["elastic_poscar"], reference_dir / "POSCAR")
     shutil.copy2(context["root_poscar"], reference_dir / "ROOT_POSCAR")
+    shutil.copy2(
+        context["original_root_poscar"], reference_dir / "ORIGINAL_ROOT_POSCAR"
+    )
     write_json(reference_dir / "structure_mapping.json", context["axis_mapping"])
     write_json(reference_dir / "phase_consistency.json", context["phase_consistency"])
     write_json(result_dir / "preflight_report.json", report)
@@ -465,6 +517,36 @@ def completed_result_matches(result_dir: Path, fingerprint_sha256: str) -> bool:
         and complete.get("fingerprint_sha256") == fingerprint_sha256
         and all((result_dir / name).is_file() for name in COMPLETE_ARTIFACTS)
     )
+
+
+def update_result_plots(
+    args: argparse.Namespace,
+    context: dict[str, Any],
+) -> dict[str, Any] | None:
+    if args.skip_plots:
+        return None
+    result_dir: Path = context["result_dir"]
+    try:
+        return generate_result_plots(
+            result_dir,
+            material_dir=context["material_dir"],
+            qha_thermal_expansion=args.qha_thermal_expansion,
+            target_temperature_K=float(args.target_temperature),
+            dpi=int(args.plot_dpi),
+        )
+    except Exception as error:
+        report = {
+            "schema_version": 1,
+            "status": "failed",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "failure": f"{type(error).__name__}:{error}",
+        }
+        write_json(result_dir / PLOT_METADATA_JSON, report)
+        print(
+            f"[alpha-split] plotting warning: {report['failure']}",
+            file=sys.stderr,
+        )
+        return report
 
 
 def assess_split_readiness(
@@ -833,6 +915,8 @@ def run_calculation(
     if abs(float(args.target_temperature) - 300.0) < 1.0e-8:
         write_json(result_dir / "alpha_volume_split_300K.json", target)
 
+    plot_report = update_result_plots(args, context)
+
     metadata = json.loads((result_dir / "run_metadata.json").read_text(encoding="utf-8"))
     metadata.update(
         {
@@ -841,6 +925,7 @@ def run_calculation(
             "runtime_versions": runtime_versions(),
             "model_path": str(model_path),
             "model_sha256": sha256_file(model_path),
+            "plots": plot_report,
         }
     )
     write_json(result_dir / "run_metadata.json", metadata)
@@ -852,6 +937,9 @@ def run_calculation(
             "quality_report": str(result_dir / "quality_report.json"),
             "alpha_split_file": str(result_dir / "alpha_volume_split.dat"),
             "target_summary": str(target_path),
+            "plot_metadata": (
+                str(result_dir / PLOT_METADATA_JSON) if plot_report is not None else None
+            ),
         },
     )
 
@@ -886,6 +974,9 @@ def main(argv: list[str] | None = None) -> None:
             *COMPLETE_ARTIFACTS,
             "alpha_volume_split_300K.json",
             "effective_gruneisen_mesh.npz",
+            ALPHA_SPLIT_PNG,
+            QHA_COMPARISON_PNG,
+            PLOT_METADATA_JSON,
         ):
             current = result_dir / name
             if not current.exists():
@@ -901,6 +992,7 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     if reuse_completed:
+        update_result_plots(args, context)
         print(f"[alpha-split] completed result matches fingerprint: {result_dir}")
         return
     metadata_path = result_dir / "run_metadata.json"

@@ -151,8 +151,10 @@ matched to its own unrelaxed state.  Element order, fixed-cell identity,
 `StructureMatcher.fit`, and the maximum periodic mapped displacement must pass;
 otherwise the central difference is rejected as a possible branch change.
 
-Unlike the older fallback behavior, `opt/CONTCAR` is not silently substituted
-when the root and elastic structures fail the phase check.
+`elastic/POSCAR` is always the calculation reference because it is the
+structure corresponding to `elastic/ELASTIC_TENSOR`.  The material-root
+`POSCAR` and `opt/CONTCAR` are retained only for provenance checks; mismatches
+are reported but do not replace or block the elastic reference.
 
 ## 6. Calculation stages
 
@@ -212,6 +214,9 @@ elastic_tensor_used.dat
 effective_gruneisen_mesh.npz
 alpha_volume_split.dat
 alpha_volume_split_target.json
+alpha_volume_split.png
+qha_vs_gruneisen_thermal_expansion.png  # when QHA alpha_V data exist
+plot_metadata.json
 quality_report.json
 run_metadata.json
 calculation_complete.json
@@ -226,6 +231,14 @@ strain_convergence.json
 production_decision.json
 production_complete.json  # only when accepted
 ```
+
+Both plots show the volumetric coefficient.  The Gruneisen curve uses the
+Cartesian engineering-Voigt selector `e=(1,1,1,0,0,0)`, and the QHA curve is
+read from Phonopy's volumetric `thermal_expansion.dat`.  Thus, including for a
+triclinic crystal, the compared quantity is
+`alpha_V=trace(alpha_Cartesian)=alpha_xx+alpha_yy+alpha_zz`; non-orthogonal
+lattice-vector expansion rates are never summed as if they were Cartesian
+diagonal tensor components.
 
 ## 9. Interpretation rule
 

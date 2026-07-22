@@ -122,6 +122,7 @@ def main() -> None:
         alpha_volume=response["alpha_volume_per_K"],
         alpha_directional=response["alpha_directional_per_K"],
         F_ani=response["F_ani"],
+        excluded_heat_capacity_fraction=response["excluded_heat_capacity_fraction"],
     )
     cartesian_rows = np.column_stack(
         [
@@ -168,6 +169,30 @@ def main() -> None:
         rows_to_text_table(
             ["T_K", "I_xx", "I_yy", "I_zz", "I_yz", "I_xz", "I_xy"],
             integral_rows,
+        ),
+        encoding="utf-8",
+    )
+    fani_rows = np.column_stack(
+        [
+            response["temperatures_K"],
+            response["alpha_volume_hyd_per_K"] * 1.0e6,
+            response["alpha_volume_dev_per_K"] * 1.0e6,
+            response["alpha_volume_per_K"] * 1.0e6,
+            response["F_ani"],
+            response["excluded_heat_capacity_fraction"],
+        ]
+    )
+    (output_dir / "fani_temperature.dat").write_text(
+        rows_to_text_table(
+            [
+                "T_K",
+                "alphaV_hyd",
+                "alphaV_dev",
+                "alphaV_total",
+                "F_ani",
+                "excluded_Cv_fraction",
+            ],
+            fani_rows,
         ),
         encoding="utf-8",
     )

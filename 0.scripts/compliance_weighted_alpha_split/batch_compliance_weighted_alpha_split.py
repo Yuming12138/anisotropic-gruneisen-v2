@@ -62,6 +62,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-internal-relax", action="store_true")
+    parser.add_argument("--skip-plots", action="store_true")
+    parser.add_argument("--plot-dpi", type=int, default=200)
     parser.add_argument("--chunk-count", type=int, default=None)
     parser.add_argument("--chunk-index", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
@@ -77,6 +79,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             raise SystemExit("--chunk-index must satisfy 0 <= index < chunk-count")
     elif args.chunk_index is not None:
         raise SystemExit("--chunk-index requires --chunk-count")
+    if args.plot_dpi <= 0:
+        raise SystemExit("--plot-dpi must be positive")
     return args
 
 
@@ -168,6 +172,8 @@ def runner_command(args: argparse.Namespace, material_dir: Path) -> list[str]:
         str(args.target_temperature),
         "--minimum-reportable-contribution-micro",
         str(args.minimum_reportable_contribution_micro),
+        "--plot-dpi",
+        str(args.plot_dpi),
         "--max-excluded-cv-fraction",
         str(args.max_excluded_cv_fraction),
         "--max-unresolved-cv-fraction",
@@ -217,6 +223,8 @@ def runner_command(args: argparse.Namespace, material_dir: Path) -> list[str]:
         command.append("--force")
     if args.skip_internal_relax:
         command.append("--skip-internal-relax")
+    if args.skip_plots:
+        command.append("--skip-plots")
     return command
 
 

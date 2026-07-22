@@ -68,12 +68,28 @@ Each mode contributes
 Positive and negative parts are sums over the sign of this final contribution,
 not the sign of an individual strain-Gruneisen component.
 
+All tensor and Voigt operations use an orthonormal Cartesian frame.  Therefore
+the plotted volumetric coefficient obeys, for triclinic crystals as well as
+every other crystal system,
+
+\[
+\alpha_V=\frac{1}{V}\frac{dV}{dT}
+=\operatorname{tr}(\boldsymbol\alpha)
+=\alpha_{xx}+\alpha_{yy}+\alpha_{zz}.
+\]
+
+The QHA comparison reads Phonopy's volumetric `thermal_expansion.dat`; it does
+not add lattice-vector expansion rates in a non-orthogonal crystallographic
+basis.
+
 ## Safeguards
 
 - `elastic/POSCAR` is the force-constant reference structure.
 - The complete imported `elastic/ELASTIC_TENSOR` is read without modification.
-- The root and elastic structures must pass a strict `StructureMatcher` phase
-  consistency check.  The optimized structure is not silently substituted.
+- `elastic/POSCAR`, i.e. the structure corresponding to the imported elastic
+  tensor, is the calculation and axis-mapping reference.  The material-root
+  `POSCAR` and `opt/CONTCAR` are provenance inputs only; any mismatch is
+  recorded without replacing the elastic reference or blocking the run.
 - The mixed strain is applied in Cartesian engineering-Voigt convention.
 - Internal coordinates are relaxed at fixed cell.
 - Each relaxed path state must remain structure-matched to its own unrelaxed
@@ -96,6 +112,7 @@ compliance_weighted_alpha_split/
 ├── v2_runtime_adapter.py
 ├── run_compliance_weighted_alpha_split.py
 ├── run_alpha_split_production.py
+├── plot_alpha_split_results.py
 ├── compare_alpha_split_runs.py
 ├── batch_compliance_weighted_alpha_split.py
 ├── test_alpha_split_core.py
@@ -198,6 +215,27 @@ requested target is exactly 300 K.  Use the target file's
 quality.  A single-strain run always leaves this field false because strain
 convergence has not been checked; the production wrapper may promote it after
 both strain amplitudes converge.
+
+Completed calculations automatically create two PNG files:
+
+```text
+alpha_volume_split.png
+qha_vs_gruneisen_thermal_expansion.png
+```
+
+The first shows the positive, negative, and total compliance-weighted
+Gruneisen contributions.  The second overlays the total Gruneisen result with
+QHA data discovered at
+`thermal_expansion/thermal_properties/thermal_expansion.dat`.  If QHA data are
+not present, the first PNG is still written and `plot_metadata.json` records a
+partial plotting result.  Results whose metadata says `300K_only` are visibly
+marked as diagnostic away from 300 K.  Use `--skip-plots` only when plotting
+must be deferred, or regenerate existing results without recalculation using:
+
+```bash
+$PYTHON $CODE/plot_alpha_split_results.py \
+  --summary-csv /path/to/final_300K_summary.csv
+```
 
 ## Tests
 
